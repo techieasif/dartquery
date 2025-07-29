@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'query.dart';
+import 'cache_config.dart';
+import 'cache_manager.dart';
 
 /// Function type for fetching query data.
 typedef QueryFunction<T> = Future<T> Function();
@@ -33,11 +35,23 @@ class QueryClient {
   /// For more complex scenarios, create dedicated instances.
   static QueryClient get instance => _instance ??= QueryClient._();
   
-  QueryClient._() {
-    // Start periodic cleanup of unused queries
-    _cleanupTimer = Timer.periodic(const Duration(minutes: 5), (_) {
-      _cleanupUnusedQueries();
-    });
+  QueryClient._([CacheConfig? cacheConfig]) : _cacheConfig = cacheConfig ?? const CacheConfig() {
+    _cacheManager = CacheManager(_cacheConfig);
+  }
+  
+  /// Creates a QueryClient instance with custom cache configuration.
+  /// 
+  /// Use this constructor to customize cache behavior, size limits,
+  /// and eviction policies for your specific use case.
+  /// 
+  /// Example:
+  /// ```dart
+  /// final client = QueryClient.withConfig(
+  ///   CacheConfig.large(), // For large applications
+  /// );
+  /// ```
+  QueryClient.withConfig(CacheConfig cacheConfig) : _cacheConfig = cacheConfig {
+    _cacheManager = CacheManager(_cacheConfig);
   }
   
   /// Creates a QueryClient instance for testing.
@@ -45,17 +59,23 @@ class QueryClient {
   /// This constructor is primarily intended for testing and doesn't start
   /// the automatic cleanup timer.
   @visibleForTesting
-  QueryClient.forTesting();
+  QueryClient.forTesting([CacheConfig? cacheConfig]) : _cacheConfig = cacheConfig ?? const CacheConfig.compact() {
+    _cacheManager = CacheManager(_cacheConfig);
+  }
 
+  final CacheConfig _cacheConfig;
+  late final CacheManager _cacheManager;
   final Map<String, Query> _queries = {};
   final Map<String, Future> _ongoingRequests = {};
-  Timer? _cleanupTimer;
   bool _disposed = false;
 
   /// Gets or creates a query with the specified [key].
   /// 
   /// If a query with the given [key] doesn't exist, creates a new one.
   /// This operation is atomic and thread-safe.
+  /// 
+  /// The cache manager will automatically handle size limits and eviction
+  /// based on the configured cache policy.
   /// 
   /// - [key]: Unique identifier for the query
   /// - [staleTime]: Duration after which data is considered stale
@@ -70,16 +90,30 @@ class QueryClient {
       throw StateError('QueryClient has been disposed');
     }
     
-    // Atomic check and create operation
-    if (!_queries.containsKey(key)) {
-      _queries[key] = Query<T>(
-        key: key,
-        staleTime: staleTime,
-        cacheTime: cacheTime,
-        onCacheExpire: _scheduleQueryRemoval,
-      );
+    // Check cache manager first
+    final cachedQuery = _cacheManager.getQuery(key);
+    if (cachedQuery != null) {
+      return cachedQuery as Query<T>;
     }
-    return _queries[key] as Query<T>;
+    
+    // Create new query if not found
+    final query = Query<T>(
+      key: key,
+      staleTime: staleTime,
+      cacheTime: cacheTime,
+      onCacheExpire: _scheduleQueryRemoval,
+    );
+    
+    // Add to both internal map and cache manager
+    _queries[key] = query;
+    _cacheManager.addQuery(key, query);
+    
+    // Log cache size warning if approaching limits
+    if (_cacheManager.isNearLimit()) {
+      debugPrint('DartQuery: Cache approaching size limits. Current stats: ${_cacheManager.getStats()}');
+    }
+    
+    return query;
   }
 
   /// Fetches data for a query, with intelligent caching and staleness checks.
@@ -242,46 +276,38 @@ class QueryClient {
   /// This operation:
   /// 1. Cancels any ongoing requests
   /// 2. Disposes the query (cleaning up timers and streams)
-  /// 3. Removes the query from cache
+  /// 3. Removes the query from cache and cache manager
   /// 
   /// The removal is atomic to prevent partial cleanup states.
   void removeQuery(String key) {
     if (_disposed) return;
     
-    // Get references before removal for atomic cleanup
-    final query = _queries[key];
-    
-    // Atomically remove from maps first
+    // Atomically remove from all storages
     _queries.remove(key);
     _ongoingRequests.remove(key);
+    _cacheManager.removeQuery(key);
     
-    // Then cleanup resources
-    query?.dispose();
+    // Cleanup is handled by cache manager
     // Note: We don't cancel ongoing requests as they might be awaited elsewhere
   }
 
   /// Atomically clears all queries and ongoing requests.
   /// 
   /// This operation:
-  /// 1. Collects all resources to cleanup
-  /// 2. Clears the maps atomically
-  /// 3. Cleans up all resources
+  /// 1. Clears all internal maps
+  /// 2. Delegates cleanup to cache manager
+  /// 3. Resets all statistics
   /// 
   /// Use this to reset the client state, typically during app shutdown.
   void clear() {
     if (_disposed) return;
     
-    // Collect all resources before clearing maps for atomic operation
-    final queriesToDispose = List<Query>.from(_queries.values);
-    
     // Atomically clear maps first
     _queries.clear();
     _ongoingRequests.clear();
     
-    // Then cleanup resources
-    for (final query in queriesToDispose) {
-      query.dispose();
-    }
+    // Let cache manager handle disposal
+    _cacheManager.clear();
   }
 
   /// Creates a reactive stream for watching query state changes.
@@ -315,22 +341,31 @@ class QueryClient {
     });
   }
   
-  /// Periodically cleans up unused queries that have no listeners.
-  void _cleanupUnusedQueries() {
+  /// Forces cache cleanup and enforces size limits.
+  /// 
+  /// This method triggers the cache manager to:
+  /// - Remove expired queries
+  /// - Enforce size limits through eviction
+  /// - Update cache statistics
+  void cleanup() {
     if (_disposed) return;
-    
-    final keysToRemove = <String>[];
-    
-    for (final entry in _queries.entries) {
-      final query = entry.value;
-      if (!query.hasListeners && !query.isDisposed) {
-        keysToRemove.add(entry.key);
-      }
-    }
-    
-    for (final key in keysToRemove) {
-      removeQuery(key);
-    }
+    _cacheManager.cleanup();
+  }
+  
+  /// Gets current cache statistics for monitoring and debugging.
+  /// 
+  /// Returns detailed information about cache usage, hit ratios,
+  /// memory consumption, and eviction counts.
+  CacheStats getCacheStats() {
+    return _cacheManager.getStats();
+  }
+  
+  /// Checks if cache is approaching configured size limits.
+  /// 
+  /// Returns true if cache usage is above the warning threshold
+  /// for either query count or memory usage.
+  bool isCacheNearLimit() {
+    return _cacheManager.isNearLimit();
   }
   
   /// Disposes the QueryClient and all its resources.
@@ -340,8 +375,7 @@ class QueryClient {
     if (_disposed) return;
     
     _disposed = true;
-    _cleanupTimer?.cancel();
-    _cleanupTimer = null;
+    _cacheManager.dispose();
     
     clear();
   }

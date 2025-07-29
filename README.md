@@ -6,10 +6,12 @@ A production-ready Dart library for reactive in-memory data management with inte
 
 - **🔄 Reactive Updates** - Automatic UI updates when data changes
 - **⚡ Smart Caching** - Intelligent caching with configurable stale and cache times
+- **📏 Cache Size Management** - Configurable limits with intelligent eviction policies
 - **🔄 Request Deduplication** - Prevents duplicate API calls for the same data
 - **💾 In-Memory Storage** - Fast key-value storage accessible across your app
 - **🎯 Query Invalidation** - Manual cache invalidation and cleanup
-- **🧠 Memory Management** - Automatic cleanup prevents memory leaks
+- **🧠 Memory Management** - Automatic cleanup and memory pressure handling
+- **📊 Cache Monitoring** - Real-time statistics and performance metrics
 - **🔧 Flutter Integration** - Purpose-built widgets for reactive UI
 - **🛡️ Type Safety** - Full TypeScript-like type safety in Dart
 - **⚡ Performance Optimized** - Atomic operations and efficient state management
@@ -546,14 +548,92 @@ QueryBuilder<User>(
 )
 ```
 
-## 🛡️ Memory Management
+## 🛡️ Cache Management & Memory Control
+
+DartQuery provides intelligent cache management to handle large applications and prevent memory issues.
+
+### Cache Size Management
+
+```dart
+// Default configuration (suitable for most apps)
+final client = QueryClient.withConfig(CacheConfig());
+
+// Large application configuration
+final client = QueryClient.withConfig(CacheConfig.large());
+
+// Memory-constrained configuration  
+final client = QueryClient.withConfig(CacheConfig.compact());
+
+// Custom configuration
+final client = QueryClient.withConfig(CacheConfig(
+  maxQueries: 200,                    // Max 200 queries in cache
+  maxMemoryBytes: 100 * 1024 * 1024,  // Max 100MB memory usage
+  evictionPolicy: EvictionPolicy.lru, // Use LRU eviction
+  enableMemoryPressureHandling: true, // React to system memory pressure
+));
+```
+
+### Eviction Policies
+
+Choose the best eviction strategy for your use case:
+
+```dart
+CacheConfig(
+  evictionPolicy: EvictionPolicy.lru,  // Least Recently Used (default)
+  evictionPolicy: EvictionPolicy.lrc,  // Least Recently Created  
+  evictionPolicy: EvictionPolicy.lfu,  // Least Frequently Used
+  evictionPolicy: EvictionPolicy.ttl,  // Time-based (staleness priority)
+)
+```
+
+### Cache Monitoring
+
+Monitor cache performance and memory usage:
+
+```dart
+// Get current cache statistics
+final stats = client.getCacheStats();
+print('Queries: ${stats.queryCount}');
+print('Memory: ${(stats.memoryBytes / 1024 / 1024).toStringAsFixed(1)}MB');
+print('Hit ratio: ${(stats.hitRatio * 100).toStringAsFixed(1)}%');
+print('Evictions: ${stats.evictions}');
+
+// Check if approaching limits
+if (client.isCacheNearLimit()) {
+  print('Cache is approaching configured limits');
+}
+
+// Force cleanup
+client.cleanup();
+```
+
+### Memory Pressure Handling
+
+DartQuery automatically responds to system memory pressure:
+
+```dart
+// Enable automatic memory pressure handling (default: true)
+CacheConfig(enableMemoryPressureHandling: true)
+
+// Manual memory pressure trigger (for testing)
+MemoryPressureHandler.instance.triggerMemoryPressure();
+
+// Get memory pressure information
+final info = MemoryPressureHandler.instance.getMemoryPressureInfo();
+print('Total memory: ${info.memoryMB.toStringAsFixed(1)}MB');
+print('Under pressure: ${info.isUnderPressure}');
+```
+
+### Automatic Memory Management
 
 DartQuery automatically manages memory to prevent leaks:
 
-- **Automatic Cleanup** - Unused queries are automatically removed
-- **Timer Management** - All timers are properly cancelled
+- **Smart Eviction** - Removes least important queries when limits are reached
+- **Memory Pressure Response** - Automatically cleans up on system memory warnings
+- **Timer Management** - All timers are properly cancelled on disposal
 - **Stream Disposal** - Broadcast streams are closed when no longer needed
 - **Widget Lifecycle** - QueryBuilder properly cleans up when disposed
+- **Listener Tracking** - Queries with active listeners are protected from eviction
 
 ### Manual Cleanup
 
@@ -564,8 +644,38 @@ DartQuery.instance.remove('temporary-data');
 // Clear all data (e.g., on logout)
 DartQuery.instance.clear();
 
+// Force cache cleanup
+client.cleanup();
+
 // Dispose custom clients
 customClient.dispose();
+```
+
+### Cache Configuration Examples
+
+**Mobile App (Memory Conscious):**
+```dart
+final client = QueryClient.withConfig(CacheConfig(
+  maxQueries: 50,
+  maxMemoryBytes: 20 * 1024 * 1024, // 20MB
+  evictionPolicy: EvictionPolicy.lru,
+  cleanupInterval: Duration(minutes: 2),
+));
+```
+
+**Desktop App (Large Dataset):**
+```dart
+final client = QueryClient.withConfig(CacheConfig(
+  maxQueries: 1000,
+  maxMemoryBytes: 500 * 1024 * 1024, // 500MB
+  evictionPolicy: EvictionPolicy.lfu,
+  cleanupInterval: Duration(minutes: 10),
+));
+```
+
+**Development/Testing (Unlimited):**
+```dart
+final client = QueryClient.withConfig(CacheConfig.unlimited());
 ```
 
 ## 🐛 Troubleshooting
@@ -585,15 +695,43 @@ DartQuery.instance.put('user-123', newUser);   // ❌
 
 **Q: Memory leaks in long-running apps**
 ```dart
+// ✅ Configure appropriate cache limits
+final client = QueryClient.withConfig(CacheConfig(
+  maxQueries: 100,
+  maxMemoryBytes: 50 * 1024 * 1024,
+  evictionPolicy: EvictionPolicy.lru,
+));
+
+// ✅ Monitor cache usage
+final stats = client.getCacheStats();
+if (stats.memoryBytes > 100 * 1024 * 1024) {
+  client.cleanup();
+}
+
 // ✅ Use appropriate cache times
 DartQuery.instance.fetch(
   'temporary-data',
   fetcher,
-  cacheTime: Duration(minutes: 1), // Short cache time
+  cacheTime: Duration(minutes: 1),
 );
+```
 
-// ✅ Clean up when done
-DartQuery.instance.remove('no-longer-needed');
+**Q: Cache growing too large**
+```dart
+// ✅ Enable automatic eviction
+final client = QueryClient.withConfig(CacheConfig(
+  maxQueries: 200,              // Limit number of queries
+  maxMemoryBytes: 100 * 1024 * 1024, // Limit memory usage
+  evictionPolicy: EvictionPolicy.lru,  // Remove least recently used
+));
+
+// ✅ Monitor and alert on cache size
+Timer.periodic(Duration(minutes: 5), (_) {
+  if (client.isCacheNearLimit()) {
+    print('Warning: Cache approaching limits');
+    client.cleanup();
+  }
+});
 ```
 
 **Q: Tests failing due to shared state**
